@@ -1,0 +1,11 @@
+{
+    "session_id": "kimi-20260216-150000-12345",
+    "timestamp": "2026-02-16T15:00:00+00:00",
+    "task_name": "example-task",
+    "telegram_group": "-1003858994641",
+    "cwd": "/workspace",
+    "prompt": "这是一个示例任务配置",
+    "output": "示例输出内容...",
+    "status": "done",
+    "exit_code": 0
+}

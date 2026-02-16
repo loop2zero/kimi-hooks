@@ -1,0 +1,17 @@
+# Sensitive info
+.env
+*.token
+*.key
+
+# Runtime files
+runs/
+latest.json
+pending-wake.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# System
+.DS_Store
