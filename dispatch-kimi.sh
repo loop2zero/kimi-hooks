@@ -1,5 +1,13 @@
 #!/bin/bash
 #
+# Auto-load .env file if exists
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    source "$ENV_FILE"
+    echo "✅ Loaded environment from $ENV_FILE"
+fi
+
 # Load environment variables from .env file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
@@ -338,3 +346,11 @@ else
 fi
 
 exit $KIMI_EXIT_CODE
+
+# Telegram mode: parse message and extract prompt
+telegram_mode() {
+    local message="$1"
+    # Remove @Kimi prefix and leading spaces
+    local prompt=$(echo "$message" | sed 's/^@Kimi[[:space:]]*//i' | sed 's/^[[:space:]]*//')
+    echo "$prompt"
+}
