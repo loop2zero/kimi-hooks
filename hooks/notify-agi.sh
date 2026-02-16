@@ -199,6 +199,7 @@ send_telegram_notification() {
     curl -s -X POST \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_GROUP}" \
+        -d "message_thread_id=14" \
         -d "text=${message}" \
         -d "parse_mode=HTML" \
         > /dev/null 2>&1 && echo "✅ Telegram notification sent" || echo "⚠️  Telegram notification failed"

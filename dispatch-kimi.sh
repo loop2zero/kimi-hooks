@@ -1,5 +1,11 @@
 #!/bin/bash
 #
+# Load environment variables from .env file
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    source "${SCRIPT_DIR}/.env"
+fi
+
 # dispatch-kimi.sh - Kimi CLI Task Dispatcher
 # Zero-polling task scheduling system for OpenClaw
 # 
