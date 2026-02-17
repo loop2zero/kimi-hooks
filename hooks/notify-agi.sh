@@ -3,13 +3,13 @@
 # notify-agi.sh - Task Completion Notification Script
 # Handles result persistence and multi-channel notifications
 #
-# 通知通道 (Notification Channels):
+# Notification Channels:
 # 1. Wake Event → POST to OpenClaw Gateway (Primary)
 # 2. pending-wake.json → AGI heartbeat polling (Fallback)
 # 3. Telegram Bot → Push notification (Optional)
 #
 
-set -euo pipefail
+set -uo pipefail
 
 # =============================================================================
 # Configuration (from environment variables)
@@ -17,6 +17,10 @@ set -euo pipefail
 OPENCLAW_GATEWAY_URL="${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:18789}"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+
+# Output size limits (inspired by Claude Code Hooks)
+MAX_OUTPUT_BYTES=4000      # Max bytes to read from output file
+MAX_TELEGRAM_BYTES=1000    # Max bytes for Telegram message summary
 
 # =============================================================================
 # Argument Validation
@@ -43,16 +47,43 @@ if [[ ! -f "$META_FILE" ]]; then
 fi
 
 # =============================================================================
-# Read Task Data
+# [P1 fix] Wait for pipe flush before reading output
+# Hook may fire before tee finishes writing
+# =============================================================================
+sleep 1
+
+# =============================================================================
+# [P1 fix] Read Task Output — Multi-source fallback (3 levels)
 # =============================================================================
 OUTPUT=""
-if [[ -f "$OUTPUT_FILE" ]]; then
-    OUTPUT=$(cat "$OUTPUT_FILE" 2>/dev/null || echo "[Unable to read output file]")
-else
-    OUTPUT="[No output file]"
+
+# Source 1: task output.log (primary, from dispatch tee)
+if [[ -f "$OUTPUT_FILE" ]] && [[ -s "$OUTPUT_FILE" ]]; then
+    OUTPUT=$(tail -c $MAX_OUTPUT_BYTES "$OUTPUT_FILE" 2>/dev/null || echo "[Unable to read output file]")
 fi
 
+# Source 2: /tmp fallback (if output.log is empty)
+TASK_NAME_FROM_META=$(jq -r '.task_name // "unknown"' "$META_FILE" 2>/dev/null || echo "unknown")
+TMP_OUTPUT="/tmp/kimi-output-${TASK_NAME_FROM_META}.txt"
+if [[ -z "$OUTPUT" ]] && [[ -f "$TMP_OUTPUT" ]] && [[ -s "$TMP_OUTPUT" ]]; then
+    OUTPUT=$(tail -c $MAX_OUTPUT_BYTES "$TMP_OUTPUT" 2>/dev/null || echo "")
+fi
+
+# Source 3: Working directory listing (last resort)
+CWD_FROM_META=$(jq -r '.cwd // "."' "$META_FILE" 2>/dev/null || echo ".")
+if [[ -z "$OUTPUT" ]] && [[ -n "$CWD_FROM_META" ]] && [[ -d "$CWD_FROM_META" ]]; then
+    FILES=$(ls -1t "$CWD_FROM_META" 2>/dev/null | head -20 | tr '\n' ', ')
+    OUTPUT="Working dir: ${CWD_FROM_META}\nRecent files: ${FILES}\n[No task output captured]"
+fi
+
+# Final fallback
+if [[ -z "$OUTPUT" ]]; then
+    OUTPUT="[No output available from any source]"
+fi
+
+# =============================================================================
 # Extract metadata
+# =============================================================================
 SESSION_ID=$(jq -r '.session_id // "unknown"' "$META_FILE")
 TASK_NAME=$(jq -r '.task_name // "unknown"' "$META_FILE")
 TELEGRAM_GROUP=$(jq -r '.telegram_group // ""' "$META_FILE")
@@ -95,6 +126,7 @@ echo "✅ Result written: ${TASK_DIR}/result.json"
 
 # =============================================================================
 # Channel 1: Send Wake Event to OpenClaw Gateway
+# [P1 fix] Added retry (1 retry after 2s delay)
 # =============================================================================
 send_wake_event() {
     # Skip if no gateway token configured
@@ -120,14 +152,29 @@ send_wake_event() {
             }
         }')
     
-    # Attempt to send wake event (non-blocking, failures ignored)
+    # Attempt to send wake event with 1 retry
     if command -v curl &>/dev/null; then
-        curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
-            -d "$event_data" \
-            "${OPENCLAW_GATEWAY_URL}/api/v1/wake" \
-            > /dev/null 2>&1 && echo "✅ Wake event sent" || echo "⚠️  Wake event failed (non-critical)"
+        local attempt=0
+        local max_attempts=2
+        while [[ $attempt -lt $max_attempts ]]; do
+            if curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
+                -d "$event_data" \
+                --connect-timeout 5 \
+                --max-time 10 \
+                "${OPENCLAW_GATEWAY_URL}/api/v1/wake" \
+                > /dev/null 2>&1; then
+                echo "✅ Wake event sent (attempt $((attempt+1)))"
+                return 0
+            fi
+            attempt=$((attempt + 1))
+            if [[ $attempt -lt $max_attempts ]]; then
+                echo "⚠️  Wake event failed, retrying in 2s..."
+                sleep 2
+            fi
+        done
+        echo "⚠️  Wake event failed after ${max_attempts} attempts (non-critical)"
     else
         echo "⚠️  curl not installed, skipping wake event"
     fi
@@ -166,6 +213,7 @@ update_pending_wake() {
 
 # =============================================================================
 # Channel 3: Send Telegram Notification (Optional)
+# [P1 fix] Output truncated to MAX_TELEGRAM_BYTES
 # =============================================================================
 send_telegram_notification() {
     # Skip if not configured
@@ -183,6 +231,10 @@ send_telegram_notification() {
         *) status_emoji="ℹ️" ;;
     esac
     
+    # [P1 fix] Truncate output for Telegram
+    local summary
+    summary=$(echo "$OUTPUT" | tail -c $MAX_TELEGRAM_BYTES | tr '\n' ' ')
+    
     # Build message
     local message
     message="${status_emoji} <b>Kimi Task Complete</b>
@@ -193,16 +245,30 @@ send_telegram_notification() {
 <b>Working Dir:</b> <code>${CWD}</code>
 <b>Time:</b> ${TIMESTAMP}
 
-<pre>$(echo "$OUTPUT" | tail -30)</pre>"
+<pre>${summary:0:800}</pre>"
 
-    # Send message (non-blocking, failures ignored)
-    curl -s -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_GROUP}" \
-        -d "message_thread_id=14" \
-        -d "text=${message}" \
-        -d "parse_mode=HTML" \
-        > /dev/null 2>&1 && echo "✅ Telegram notification sent" || echo "⚠️  Telegram notification failed"
+    # Send message with retry (non-blocking)
+    local attempt=0
+    local max_attempts=2
+    while [[ $attempt -lt $max_attempts ]]; do
+        if curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_GROUP}" \
+            -d "message_thread_id=14" \
+            -d "text=${message}" \
+            -d "parse_mode=HTML" \
+            --connect-timeout 5 \
+            --max-time 10 \
+            > /dev/null 2>&1; then
+            echo "✅ Telegram notification sent (attempt $((attempt+1)))"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [[ $attempt -lt $max_attempts ]]; then
+            sleep 2
+        fi
+    done
+    echo "⚠️  Telegram notification failed after ${max_attempts} attempts"
 }
 
 # =============================================================================
@@ -213,7 +279,7 @@ echo "========================================="
 echo "📬 Sending notifications..."
 echo "========================================="
 
-# Update pending wake file (fallback channel)
+# Update pending wake file (fallback channel — always do this first)
 update_pending_wake
 
 # Send wake event (primary channel) - background
@@ -224,9 +290,9 @@ WAKE_PID=$!
 send_telegram_notification &
 TG_PID=$!
 
-# Wait for notifications (max 5 seconds)
-wait -f $WAKE_PID $TG_PID 2>/dev/null || true
-sleep 1
+# Wait for notifications (compatible with bash 4.x+)
+wait $WAKE_PID 2>/dev/null || true
+wait $TG_PID 2>/dev/null || true
 
 echo "========================================="
 echo "✨ Task Complete"

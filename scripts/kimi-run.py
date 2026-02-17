@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 #
-# kimi-run.py - Kimi CLI PTY Runner
-# Captures full output using subprocess with real-time streaming
+# kimi-run.py - Kimi CLI Runner
+# Captures full output with real-time streaming
 #
-# 功能 (Features):
-# - Real-time output capture
+# Features:
+# - Real-time output capture via tee-style streaming
 # - Timeout handling
 # - Allowed tools restriction
-# - Mock mode for testing (when kimi CLI not installed)
+# - Strict mode: no mock fallback — fails loudly if Kimi CLI not found
+# - PTY support via script(1) for non-interactive environments
 #
 
 import argparse
 import json
 import os
-import select
+import shlex
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from datetime import datetime
 
 
 class KimiRunner:
-    """Kimi CLI runner with PTY support and output capture."""
+    """Kimi CLI runner with output capture."""
     
     def __init__(self, prompt, workdir, timeout=3600, meta_file=None, allowed_tools=None):
         self.prompt = prompt
@@ -37,20 +38,25 @@ class KimiRunner:
         self.workdir.mkdir(parents=True, exist_ok=True)
     
     def run(self):
-        """Run Kimi CLI or mock execution."""
+        """Run Kimi CLI. Fails loudly if not installed."""
         self.start_time = time.time()
         
-        # Check if kimi command exists
-        kimi_exists = self._check_kimi_cli()
-        
-        if not kimi_exists:
-            print("[INFO] Kimi CLI not found, switching to mock mode", file=sys.stderr)
-            return self._mock_kimi_execution()
+        # [P0 fix] Check if kimi command exists — no mock fallback
+        if not self._check_kimi_cli():
+            print("[FATAL] Kimi CLI not found in PATH.", file=sys.stderr)
+            print("[FATAL] Install with: pip install kimi-cli && kimi login", file=sys.stderr)
+            print("[FATAL] Or set KIMI_BIN environment variable to the correct path.", file=sys.stderr)
+            return 127  # Standard "command not found" exit code
         
         return self._run_kimi_cli()
     
     def _check_kimi_cli(self):
         """Check if kimi CLI is installed."""
+        # Check KIMI_BIN env var first
+        kimi_bin = os.environ.get("KIMI_BIN", "")
+        if kimi_bin and Path(kimi_bin).is_file():
+            return True
+        
         try:
             result = subprocess.run(
                 ['which', 'kimi'],
@@ -61,10 +67,19 @@ class KimiRunner:
         except Exception:
             return False
     
+    def _get_kimi_bin(self):
+        """Get kimi binary path."""
+        kimi_bin = os.environ.get("KIMI_BIN", "")
+        if kimi_bin and Path(kimi_bin).is_file():
+            return kimi_bin
+        return "kimi"
+    
     def _run_kimi_cli(self):
-        """Run actual Kimi CLI process."""
+        """Run actual Kimi CLI process with PTY support."""
+        kimi_bin = self._get_kimi_bin()
+        
         # Build command arguments
-        cmd = ['kimi', '--print', '-p', self.prompt, '-w', str(self.workdir)]
+        cmd = [kimi_bin, '--print', '-p', self.prompt, '-w', str(self.workdir)]
         
         # Add allowed tools if specified
         if self.allowed_tools:
@@ -72,142 +87,98 @@ class KimiRunner:
         
         print(f"[Kimi] Executing: {' '.join(cmd)}", file=sys.stderr)
         
+        # [P3] Try to use script(1) for PTY support (prevents hanging in non-TTY)
+        use_script = self._check_script_available()
+        
         try:
-            # Start process
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=self.workdir,
-                text=True,
-                encoding='utf-8',
-                errors='replace'
-            )
-            
-            # Real-time output reading with timeout
+            if use_script:
+                return self._run_with_script(cmd)
+            else:
+                return self._run_direct(cmd)
+                
+        except FileNotFoundError:
+            print(f"[FATAL] Failed to start kimi process: {kimi_bin} not found", file=sys.stderr)
+            return 127
+        except KeyboardInterrupt:
+            print("\n[INTERRUPT] Received interrupt signal", file=sys.stderr)
+            return 130
+        except Exception as e:
+            print(f"[ERROR] Unexpected error: {e}", file=sys.stderr)
+            return 1
+    
+    def _check_script_available(self):
+        """Check if script(1) command is available."""
+        try:
+            result = subprocess.run(['which', 'script'], capture_output=True, timeout=3)
+            return result.returncode == 0
+        except Exception:
+            return False
+    
+    def _run_with_script(self, cmd):
+        """Run command wrapped in script(1) for PTY support."""
+        cmd_str = " ".join(shlex.quote(c) for c in cmd)
+        script_cmd = ['script', '-q', '-c', cmd_str, '/dev/null']
+        
+        print(f"[Kimi] Using script(1) for PTY support", file=sys.stderr)
+        return self._run_process(script_cmd)
+    
+    def _run_direct(self, cmd):
+        """Run command directly without PTY wrapper."""
+        print(f"[Kimi] Running directly (no script(1) available)", file=sys.stderr)
+        return self._run_process(cmd)
+    
+    def _run_process(self, cmd):
+        """Run a subprocess with timeout and output capture."""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=self.workdir,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        try:
             while True:
                 # Check timeout
                 elapsed = time.time() - self.start_time
                 if elapsed > self.timeout:
                     print(f"\n[TIMEOUT] Task exceeded {self.timeout} seconds", file=sys.stderr)
                     process.terminate()
-                    time.sleep(1)
+                    time.sleep(2)
                     if process.poll() is None:
                         process.kill()
                     return 124
                 
-                # Check if output available
+                # Read output line by line
                 if process.stdout:
-                    readable, _, _ = select.select([process.stdout], [], [], 0.1)
-                    if readable:
-                        line = process.stdout.readline()
-                        if line:
-                            self.output_buffer.append(line)
-                            sys.stderr.write(line)
-                            sys.stderr.flush()
-                
-                # Check if process finished
-                ret = process.poll()
-                if ret is not None:
-                    # Read remaining output
-                    remaining = process.stdout.read() if process.stdout else ""
-                    if remaining:
-                        self.output_buffer.append(remaining)
-                        sys.stderr.write(remaining)
+                    line = process.stdout.readline()
+                    if line:
+                        self.output_buffer.append(line)
+                        sys.stderr.write(line)
                         sys.stderr.flush()
-                    return ret
-                    
-        except FileNotFoundError:
-            print("[ERROR] Failed to start kimi process", file=sys.stderr)
-            return self._mock_kimi_execution()
+                    elif process.poll() is not None:
+                        # Process finished and no more output
+                        break
+                else:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.1)
+            
+            # Read any remaining output
+            if process.stdout:
+                remaining = process.stdout.read()
+                if remaining:
+                    self.output_buffer.append(remaining)
+                    sys.stderr.write(remaining)
+                    sys.stderr.flush()
+            
+            return process.returncode
+            
         except KeyboardInterrupt:
-            print("\n[INTERRUPT] Received interrupt signal", file=sys.stderr)
-            if 'process' in locals():
-                process.terminate()
-            return 130
-        except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}", file=sys.stderr)
-            return 1
-    
-    def _mock_kimi_execution(self):
-        """Mock kimi execution for testing/demo purposes."""
-        print(f"[Kimi Mock] Working Directory: {self.workdir}", file=sys.stderr)
-        print(f"[Kimi Mock] Prompt: {self.prompt}", file=sys.stderr)
-        if self.allowed_tools:
-            print(f"[Kimi Mock] Allowed Tools: {self.allowed_tools}", file=sys.stderr)
-        print("-" * 50, file=sys.stderr)
-        
-        # Simulate thinking
-        print("Thinking...", file=sys.stderr)
-        time.sleep(0.5)
-        
-        # Generate mock response based on prompt
-        prompt_lower = self.prompt.lower()
-        
-        if "hello" in prompt_lower or "world" in prompt_lower:
-            mock_output = '''\n```python
-# hello_world.py
-print("Hello, World!")
-print("Generated by Kimi CLI")
-```
-
-This is a simple Python Hello World program.
-
-Run with:
-```bash
-python hello_world.py
-```
-'''
-        elif "analyze" in prompt_lower or "分析" in prompt_lower:
-            mock_output = f'''\n## Analysis Results
-
-**Task**: {self.prompt}
-**Time**: {datetime.now().isoformat()}
-
-### Summary
-This is a mock analysis response for testing purposes.
-
-### Key Points
-1. Point A - Important finding
-2. Point B - Secondary observation
-3. Point C - Recommendation
-
-### Output Files
-Generated in: {self.workdir}
-'''
-        else:
-            mock_output = f'''\n[Kimi Mock Response]
-
-Your request: {self.prompt}
-
-This is a simulated response from the kimi-hooks system.
-In production, this would contain actual Kimi CLI output.
-
----
-Timestamp: {datetime.now().isoformat()}
-Working Directory: {self.workdir}
-Allowed Tools: {self.allowed_tools or "all"}
-'''
-        
-        print(mock_output, file=sys.stderr)
-        self.output_buffer.append(mock_output)
-        
-        print("-" * 50, file=sys.stderr)
-        print("[Kimi Mock] Task completed", file=sys.stderr)
-        
-        # Create a test file if directory is writable
-        test_file = self.workdir / "kimi_test_output.txt"
-        try:
-            test_file.write_text(
-                f"Kimi task completed at {datetime.now()}\n"
-                f"Prompt: {self.prompt}\n"
-                f"Mode: MOCK\n"
-            )
-            print(f"[Kimi Mock] Test file created: {test_file}", file=sys.stderr)
-        except PermissionError:
-            pass
-        
-        return 0
+            process.terminate()
+            raise
     
     def get_output(self):
         """Get complete output as string."""
@@ -216,7 +187,7 @@ Allowed Tools: {self.allowed_tools or "all"}
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Kimi CLI Runner - PTY wrapper with output capture'
+        description='Kimi CLI Runner - Wrapper with output capture and timeout'
     )
     parser.add_argument(
         '-p', '--prompt',

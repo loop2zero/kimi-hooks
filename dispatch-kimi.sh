@@ -1,19 +1,5 @@
 #!/bin/bash
 #
-# Auto-load .env file if exists
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
-if [[ -f "$ENV_FILE" ]]; then
-    source "$ENV_FILE"
-    echo "✅ Loaded environment from $ENV_FILE"
-fi
-
-# Load environment variables from .env file
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-    source "${SCRIPT_DIR}/.env"
-fi
-
 # dispatch-kimi.sh - Kimi CLI Task Dispatcher
 # Zero-polling task scheduling system for OpenClaw
 # 
@@ -23,9 +9,19 @@ fi
 set -euo pipefail
 
 # =============================================================================
+# Auto-load .env file (once)
+# =============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    source "$ENV_FILE"
+    echo "✅ Loaded environment from $ENV_FILE"
+fi
+
+# =============================================================================
 # Configuration (Override via environment variables)
 # =============================================================================
-KIMI_HOOKS_DIR="${KIMI_HOOKS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+KIMI_HOOKS_DIR="${KIMI_HOOKS_DIR:-$SCRIPT_DIR}"
 OPENCLAW_GATEWAY_URL="${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:18789}"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -77,11 +73,12 @@ EOF
 
 # =============================================================================
 # Lock Mechanism - Prevent duplicate triggers within 30 seconds
+# Uses file modification time (more reliable than reading content)
 # =============================================================================
 check_lock() {
     if [[ -f "$LOCK_FILE" ]]; then
         local lock_time
-        lock_time=$(cat "$LOCK_FILE" 2>/dev/null || echo "0")
+        lock_time=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo "0")
         local current_time
         current_time=$(date +%s)
         local time_diff=$((current_time - lock_time))
@@ -93,8 +90,8 @@ check_lock() {
         fi
     fi
     
-    # Create/update lock file
-    date +%s > "$LOCK_FILE"
+    # Create/update lock file (touch updates mtime)
+    touch "$LOCK_FILE"
 }
 
 release_lock() {
@@ -209,12 +206,13 @@ check_lock
 
 # =============================================================================
 # Background Mode - Re-execute with nohup
+# [P0 fix] Removed 'local' keyword — not valid outside functions
 # =============================================================================
 if [[ "$BACKGROUND" == true ]]; then
     echo "🔄 Background mode enabled, detaching process..."
     
     # Build command without --background flag
-    local cmd_args=()
+    cmd_args=()
     cmd_args+=("-p" "$PROMPT")
     cmd_args+=("-n" "$TASK_NAME")
     [[ -n "$TELEGRAM_GROUP" ]] && cmd_args+=("-g" "$TELEGRAM_GROUP")
@@ -224,11 +222,11 @@ if [[ "$BACKGROUND" == true ]]; then
     
     # Create log directory
     mkdir -p "${KIMI_HOOKS_DIR}/logs"
-    local nohup_log="${KIMI_HOOKS_DIR}/logs/${RUN_ID}.log"
+    nohup_log="${KIMI_HOOKS_DIR}/logs/${RUN_ID}.log"
     
     # Re-execute with nohup
     nohup "$0" "${cmd_args[@]}" > "$nohup_log" 2>&1 &
-    local bg_pid=$!
+    bg_pid=$!
     
     echo "✅ Task running in background (PID: $bg_pid)"
     echo "   Log file: $nohup_log"
@@ -260,7 +258,8 @@ cat > "${TASK_DIR}/task-meta.json" <<EOF
     "timeout": ${TIMEOUT},
     "allowed_tools": "${ALLOWED_TOOLS}",
     "pid": $$,
-    "background": ${BACKGROUND}
+    "background": ${BACKGROUND},
+    "status": "running"
 }
 EOF
 
@@ -297,6 +296,14 @@ cleanup() {
     echo "📝 Task execution ended, status: ${status}"
     echo "========================================="
     
+    # [P1 fix] Update task-meta.json with completion status
+    if [[ -f "${TASK_DIR}/task-meta.json" ]]; then
+        jq --arg code "$exit_code" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S%z)" --arg st "$status" \
+            '. + {exit_code: ($code | tonumber), completed_at: $ts, status: $st}' \
+            "${TASK_DIR}/task-meta.json" > "${TASK_DIR}/task-meta.json.tmp" \
+            && mv "${TASK_DIR}/task-meta.json.tmp" "${TASK_DIR}/task-meta.json"
+    fi
+    
     # Write to pending wake file (fallback channel)
     write_pending_wake "$SESSION_ID" "$TASK_NAME" "$status"
     
@@ -332,9 +339,9 @@ RUN_ARGS=(
 [[ -n "$ALLOWED_TOOLS" ]] && RUN_ARGS+=(--allowed-tools "$ALLOWED_TOOLS")
 
 echo "🤖 Starting Kimi CLI..."
-"${KIMI_HOOKS_DIR}/scripts/kimi-run.py" "${RUN_ARGS[@]}" > "$OUTPUT_FILE" 2>&1
+"${KIMI_HOOKS_DIR}/scripts/kimi-run.py" "${RUN_ARGS[@]}" 2>&1 | tee "$OUTPUT_FILE"
 
-KIMI_EXIT_CODE=$?
+KIMI_EXIT_CODE=${PIPESTATUS[0]}
 
 # Save exit code
 echo $KIMI_EXIT_CODE > "${TASK_DIR}/exit-code.txt"
@@ -346,11 +353,3 @@ else
 fi
 
 exit $KIMI_EXIT_CODE
-
-# Telegram mode: parse message and extract prompt
-telegram_mode() {
-    local message="$1"
-    # Remove @Kimi prefix and leading spaces
-    local prompt=$(echo "$message" | sed 's/^@Kimi[[:space:]]*//i' | sed 's/^[[:space:]]*//')
-    echo "$prompt"
-}
