@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 
 # Lock mechanism configuration
 LOCK_FILE="${KIMI_HOOKS_DIR}/.hook-lock"
-LOCK_TIMEOUT=30  # 30 seconds deduplication window
+LOCK_TIMEOUT=3  # 3 seconds deduplication window (prevents double-fire but avoids blocking legit retries)
 
 # Pending wake file (fallback channel)
 PENDING_WAKE_FILE="${KIMI_HOOKS_DIR}/pending-wake.json"
@@ -86,7 +86,8 @@ check_lock() {
         if [[ $time_diff -lt $LOCK_TIMEOUT ]]; then
             echo "⚠️  Duplicate trigger detected (last trigger: ${time_diff}s ago)" >&2
             echo "    Only processing the first event (deduplication window: ${LOCK_TIMEOUT}s)" >&2
-            exit 0
+            # Exit with a distinct code so upstream (router/bot) can avoid saying "dispatched"
+            exit 2
         fi
     fi
     
