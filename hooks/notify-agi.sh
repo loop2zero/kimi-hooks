@@ -126,7 +126,7 @@ echo "✅ Result written: ${TASK_DIR}/result.json"
 
 # =============================================================================
 # Channel 1: Send Wake Event to OpenClaw Gateway
-# [P1 fix] Added retry (1 retry after 2s delay)
+# Strategy: openclaw CLI (primary) → HTTP POST (fallback) → pending-wake.json (always)
 # =============================================================================
 send_wake_event() {
     # Skip if no gateway token configured
@@ -135,48 +135,64 @@ send_wake_event() {
         return 0
     fi
     
-    local event_data
-    event_data=$(jq -n \
-        --arg type "kimi-task-complete" \
-        --arg session_id "$SESSION_ID" \
-        --arg task_name "$TASK_NAME" \
-        --arg status "$STATUS" \
-        --arg timestamp "$TIMESTAMP" \
-        '{
-            type: $type,
-            payload: {
-                session_id: $session_id,
-                task_name: $task_name,
-                status: $status,
-                timestamp: $timestamp
-            }
-        }')
+    local wake_text="[Kimi Task Complete] ${TASK_NAME} — ${STATUS} (exit ${EXIT_CODE})"
     
-    # Attempt to send wake event with 1 retry
-    if command -v curl &>/dev/null; then
+    # --- Method A: openclaw CLI (primary, uses WebSocket internally) ---
+    if command -v openclaw &>/dev/null; then
         local attempt=0
         local max_attempts=2
         while [[ $attempt -lt $max_attempts ]]; do
-            if curl -s -X POST \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
-                -d "$event_data" \
-                --connect-timeout 5 \
-                --max-time 10 \
-                "${OPENCLAW_GATEWAY_URL}/api/v1/wake" \
-                > /dev/null 2>&1; then
-                echo "✅ Wake event sent (attempt $((attempt+1)))"
+            if openclaw system event \
+                --text "$wake_text" \
+                --mode now \
+                --token "$OPENCLAW_GATEWAY_TOKEN" \
+                --url "ws://127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}" \
+                --json 2>/dev/null | grep -q '"ok"'; then
+                echo "✅ Wake event sent via CLI (attempt $((attempt+1)))"
                 return 0
             fi
             attempt=$((attempt + 1))
             if [[ $attempt -lt $max_attempts ]]; then
-                echo "⚠️  Wake event failed, retrying in 2s..."
+                echo "⚠️  CLI wake failed, retrying in 2s..."
                 sleep 2
             fi
         done
-        echo "⚠️  Wake event failed after ${max_attempts} attempts (non-critical)"
+        echo "⚠️  CLI wake failed after ${max_attempts} attempts, trying HTTP fallback..."
+    fi
+    
+    # --- Method B: HTTP POST (fallback, in case future API supports it) ---
+    if command -v curl &>/dev/null; then
+        local event_data
+        event_data=$(jq -n \
+            --arg type "kimi-task-complete" \
+            --arg session_id "$SESSION_ID" \
+            --arg task_name "$TASK_NAME" \
+            --arg status "$STATUS" \
+            --arg timestamp "$TIMESTAMP" \
+            '{
+                type: $type,
+                payload: {
+                    session_id: $session_id,
+                    task_name: $task_name,
+                    status: $status,
+                    timestamp: $timestamp
+                }
+            }')
+        
+        if curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
+            -d "$event_data" \
+            --connect-timeout 5 \
+            --max-time 10 \
+            "${OPENCLAW_GATEWAY_URL}/api/v1/wake" \
+            > /dev/null 2>&1; then
+            echo "✅ Wake event sent via HTTP"
+            return 0
+        fi
+        echo "⚠️  HTTP wake also failed (non-critical, pending-wake.json is the safety net)"
     else
-        echo "⚠️  curl not installed, skipping wake event"
+        echo "⚠️  Neither openclaw CLI nor curl available for wake event"
     fi
 }
 
